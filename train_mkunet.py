@@ -18,11 +18,17 @@ from dataset import TIFSegmentationDataset  # 改为TIF数据集
 # 训练参数
 BATCH_SIZE = 4
 NUM_EPOCHS = 60  # 🔥 增加训练轮数到 60
-LEARNING_RATE = 5e-4  # 🔥 提高初始学习率
+LEARNING_RATE = 3e-4  # 🔥 降低学习率，避免训练崩溃 (从 1e-3 调整到 3e-4)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # 🔥 新增：梯度累积步数 (模拟更大的 batch size)
 GRADIENT_ACCUMULATION_STEPS = 2
+
+# 🔥 新增：混合精度训练 (节省显存，加速训练)
+USE_AMP = True
+
+# 🔥 新增：梯度裁剪阈值 (防止梯度爆炸)
+GRADIENT_CLIP_VALUE = 1.0
 
 # 数据路径 (修改为 TIF数据集)
 TRAIN_IMG_DIR = './dataset/kaggle_3m/train'
@@ -59,7 +65,8 @@ class FocalLoss(nn.Module):
         self.gamma = gamma
 
     def forward(self, pred, target):
-        bce_loss = nn.BCELoss(reduction='none')(pred, target)
+        # 🔥 使用 BCEWithLogitsLoss 替代 BCELoss 以支持混合精度训练
+        bce_loss = nn.BCEWithLogitsLoss(reduction='none')(pred, target)
         pt = torch.exp(-bce_loss)
         focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
         return focal_loss.mean()
@@ -77,6 +84,11 @@ def combined_loss(pred, target):
     
     # 🔥 调整权重：Focal Loss 0.5 + Dice Loss 0.5
     return 0.5 * focal + 0.5 * dice_loss
+
+# ==========================================
+# 新增：混合精度训练 Scaler
+# ==========================================
+scaler = torch.amp.GradScaler('cuda') if USE_AMP and DEVICE.type == 'cuda' else None
 
 # ==========================================
 # 新增：SwanLab 随机验证集可视化函数
@@ -140,7 +152,7 @@ def log_predictions_to_swanlab(model, dataset, device, num_samples=4):
 # ==========================================
 # 独立的训练核心函数 (已整合深度监督 Deep Supervision)
 # ==========================================
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, save_path, scheduler=None, gradient_accumulation_steps=1):
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, save_path, scheduler=None, gradient_accumulation_steps=1, scaler=None):
     best_val_dice = 0.0
     patience = 10  # 🔥 增加早停耐心值到 10
     patience_counter = 0
@@ -162,28 +174,49 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         for i, (images, masks) in enumerate(train_loader):
             images, masks = images.to(device), masks.to(device)
                     
-            # 🔥 1. 深度监督：接收主分支和两个辅助分支的预测结果
-            outputs_main, outputs_up2, outputs_up3 = model(images)
-                    
-            # 🔥 2. 将辅助分支的特征图上采样 (放大) 到真实 Mask 的尺寸 (256x256)
-            outputs_up2 = F.interpolate(outputs_up2, size=masks.shape[2:], mode='bilinear', align_corners=False)
-            outputs_up3 = F.interpolate(outputs_up3, size=masks.shape[2:], mode='bilinear', align_corners=False)
-                    
-            # 🔥 3. 计算多尺度联合损失 (权重分配：主输出 0.6, 辅助输出各 0.2)
-            loss_main = criterion(outputs_main, masks)
-            loss_up2 = criterion(outputs_up2, masks)
-            loss_up3 = criterion(outputs_up3, masks)
-            loss = 0.6 * loss_main + 0.2 * loss_up2 + 0.2 * loss_up3
-                    
-            # 🔥 梯度累积：缩放 loss 以模拟更大的 batch size
-            loss = loss / gradient_accumulation_steps
-                    
-            loss.backward()
-                    
-            # 🔥 梯度累积：每隔 accumulation_steps 步更新一次参数
-            if (i + 1) % gradient_accumulation_steps == 0 or (i + 1) == len(train_loader):
-                optimizer.step()
-                optimizer.zero_grad()
+            # 🔥 使用混合精度训练
+            with torch.amp.autocast('cuda', enabled=scaler is not None):
+                # 🔥 1. 深度监督：接收主分支和两个辅助分支的预测结果
+                outputs_main, outputs_up2, outputs_up3 = model(images)
+                        
+                # 🔥 2. 将辅助分支的特征图上采样 (放大) 到真实 Mask 的尺寸 (256x256)
+                outputs_up2 = F.interpolate(outputs_up2, size=masks.shape[2:], mode='bilinear', align_corners=False)
+                outputs_up3 = F.interpolate(outputs_up3, size=masks.shape[2:], mode='bilinear', align_corners=False)
+                        
+                # 🔥 3. 计算多尺度联合损失 (权重分配：主输出 0.6, 辅助输出各 0.2)
+                loss_main = criterion(outputs_main, masks)
+                loss_up2 = criterion(outputs_up2, masks)
+                loss_up3 = criterion(outputs_up3, masks)
+                loss = 0.6 * loss_main + 0.2 * loss_up2 + 0.2 * loss_up3
+                        
+                # 🔥 梯度累积：缩放 loss 以模拟更大的 batch size
+                loss = loss / gradient_accumulation_steps
+            
+            # 🔥 使用 scaler 进行反向传播
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                        
+                # 🔥 梯度累积：每隔 accumulation_steps 步更新一次参数
+                if (i + 1) % gradient_accumulation_steps == 0 or (i + 1) == len(train_loader):
+                    # 🔥 新增：梯度裁剪 (防止梯度爆炸)
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRADIENT_CLIP_VALUE)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    # 🔥 OneCycleLR 需要在每个 step 后更新
+                    scheduler.step()
+                    optimizer.zero_grad()
+            else:
+                loss.backward()
+                        
+                # 🔥 梯度累积：每隔 accumulation_steps 步更新一次参数
+                if (i + 1) % gradient_accumulation_steps == 0 or (i + 1) == len(train_loader):
+                    # 🔥 新增：梯度裁剪 (防止梯度爆炸)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRADIENT_CLIP_VALUE)
+                    optimizer.step()
+                    # 🔥 OneCycleLR 需要在每个 step 后更新
+                    scheduler.step()
+                    optimizer.zero_grad()
                     
             train_loss += loss.item() * gradient_accumulation_steps  # 恢复原始 loss 用于日志
                     
@@ -199,7 +232,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         avg_train_dice = train_dice_sum / len(train_loader)
         avg_train_iou = train_iou_sum / len(train_loader)
         
-        # --- 验证阶段 ---
+        # --- 验证阶段 (使用混合精度) ---
         model.eval()
         val_loss = 0
         val_dice_sum = 0
@@ -209,9 +242,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             for images, masks in val_loader:
                 images, masks = images.to(device), masks.to(device)
                 
-                # 🔥 验证模式下，模型只返回主分支输出
-                outputs_main = model(images)
-                loss = criterion(outputs_main, masks)
+                # 🔥 验证模式也使用混合精度
+                with torch.amp.autocast('cuda', enabled=scaler is not None):
+                    outputs_main = model(images)
+                    loss = criterion(outputs_main, masks)
                 
                 val_loss += loss.item()
                 dice, iou = calculate_metrics(outputs_main, masks)
@@ -237,12 +271,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             "Val/Loss": avg_val_loss,
             "Val/Dice": avg_val_dice,
             "Val/IoU": avg_val_iou,
-            "Optimizer/Learning_Rate": scheduler.get_last_lr()[0] if scheduler else optimizer.param_groups[0]['lr']
+            "Optimizer/Learning_Rate": optimizer.param_groups[0]['lr']  # OneCycleLR 不需要 get_last_lr()
         }, step=epoch+1)
         
-        # 🔥 更新学习率调度器
-        if scheduler:
-            scheduler.step()
+        # 🔥 OneCycleLR 已经在每个 batch 后自动更新，不需要在这里调用 scheduler.step()
 
         # 早停与最佳模型保存策略
         if avg_val_dice > best_val_dice:
@@ -271,28 +303,34 @@ def main():
     try:
         run = swanlab.init(
             project="Medical-Image-Segmentation-Graduation", 
-            experiment_name="Innovation-MKUNet-DeepSupervision-Improved",
+            experiment_name="MKUNet-Stable-HighDice",
             config={
-                "model": "MK-UNet (Deep Supervision + Focal Loss)",
+                "model": "MK-UNet (Stable Training + Gradient Clipping)",
                 "batch_size": BATCH_SIZE,
                 "learning_rate": LEARNING_RATE,
                 "epochs": NUM_EPOCHS,
                 "device": str(DEVICE),
-                "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS
+                "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+                "gradient_clip_value": GRADIENT_CLIP_VALUE,
+                "use_amp": USE_AMP,
+                "lr_scheduler": "OneCycleLR with Warmup"
             }
         )
     except Exception as e:
         print(f"⚠️ SwanLab 云端连接失败：{e}\n   切换到本地离线模式...")
         run = swanlab.init(
             project="Medical-Image-Segmentation-Graduation", 
-            experiment_name="Innovation-MKUNet-DeepSupervision-Improved-Local",
+            experiment_name="MKUNet-Stable-HighDice-Local",
             config={
-                "model": "MK-UNet (Deep Supervision + Focal Loss)",
+                "model": "MK-UNet (Stable Training + Gradient Clipping)",
                 "batch_size": BATCH_SIZE,
                 "learning_rate": LEARNING_RATE,
                 "epochs": NUM_EPOCHS,
                 "device": str(DEVICE),
-                "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS
+                "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+                "gradient_clip_value": GRADIENT_CLIP_VALUE,
+                "use_amp": USE_AMP,
+                "lr_scheduler": "OneCycleLR with Warmup"
             },
             mode="local"
         )
@@ -319,13 +357,35 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"🔥 当前 MK-UNet 参数量：{total_params/1e6:.4f} M\n")
     
-    # 🔥 优化器：使用 AdamW (带权重衰减)
+    # 🔥 优化器：使用 AdamW (带权重衰减)，根据论文设置
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
         
-    # 🔥 学习率调度器：余弦退火 (Cosine Annealing)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+    # 🔥 学习率调度器：使用带 Warmup 的 OneCycleLR (更稳定)
+    # 🔥 前 10% 的 epoch 用于 warmup，然后使用余弦退火衰减
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=LEARNING_RATE,
+        epochs=NUM_EPOCHS,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.1,  # 10% warmup
+        anneal_strategy='cos',
+        div_factor=25.0,  # 初始 lr = max_lr/25
+        final_div_factor=1000.0  # 最终 lr = max_lr/1000
+    )
     
-    # 4. 调用训练核心函数
+    # 🔥 混合精度训练 scaler
+    scaler = torch.amp.GradScaler('cuda') if USE_AMP and DEVICE.type == 'cuda' else None
+    
+    print(f"\n🚀 开始训练 MK-UNet 模型...")
+    print(f"   - 设备：{DEVICE}")
+    print(f"   - 学习率：{LEARNING_RATE} (带 Warmup)")
+    print(f"   - Batch Size: {BATCH_SIZE} (梯度累积：{GRADIENT_ACCUMULATION_STEPS})")
+    print(f"   - 混合精度训练：{'启用' if scaler is not None else '禁用'}")
+    print(f"   - 梯度裁剪：{'启用 (max_norm=1.0)' if GRADIENT_CLIP_VALUE > 0 else '禁用'}")
+    print(f"   - 学习率调度器：OneCycleLR with Warmup")
+    print("="*60)
+    
+    # 4. 调用训练核心函数 (传入 scaler)
     train_model(
         model=model,
         train_loader=train_loader,
@@ -335,8 +395,9 @@ def main():
         num_epochs=NUM_EPOCHS,
         device=DEVICE,
         save_path=save_path,
-        scheduler=scheduler,  # 🔥 传入学习率调度器
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS  # 🔥 传入梯度累积步数
+        scheduler=scheduler,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        scaler=scaler
     )
 
     # ==========================================

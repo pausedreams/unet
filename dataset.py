@@ -200,13 +200,13 @@ class TIFSegmentationDataset(Dataset):
                 mask_pil = TF.vflip(mask_pil)
             
             if random.random() > 0.5:
-                angle = random.randint(-20, 20)
+                angle = random.randint(-15, 15)  # 🔥 从 -20~20 降低到 -15~15
                 image_pil = TF.rotate(image_pil, angle, interpolation=Image.BILINEAR)
                 mask_pil = TF.rotate(mask_pil, angle, interpolation=Image.NEAREST)
             
-            # 🔥 新增：随机缩放 (90% - 110%，避免过小导致裁剪失败)
+            # 🔥 优化：随机缩放 (缩小范围，提高稳定性)
             if random.random() > 0.5:
-                scale = random.uniform(0.9, 1.1)
+                scale = random.uniform(0.95, 1.05)  # 🔥 从 90%-110% 缩小到 95%-105%
                 new_size = int(256 * scale)
                 # 确保 new_size 至少为 256
                 if new_size >= 256:
@@ -217,10 +217,14 @@ class TIFSegmentationDataset(Dataset):
                     image_pil = TF.crop(image_pil, i, j, 256, 256)
                     mask_pil = TF.crop(mask_pil, i, j, 256, 256)
             
-            # 🔥 新增：颜色抖动 (仅图像，不影响 Mask)
+            # 🔥 优化：颜色抖动 (降低强度，避免图像失真)
             if random.random() > 0.5:
-                image_pil = TF.adjust_brightness(image_pil, random.uniform(0.9, 1.1))
-                image_pil = TF.adjust_contrast(image_pil, random.uniform(0.9, 1.1))
+                brightness = random.uniform(0.95, 1.05)  # 🔥 降低亮度变化范围
+                contrast = random.uniform(0.95, 1.05)    # 🔥 降低对比度变化范围
+                saturation = random.uniform(0.95, 1.05)  # 🔥 降低饱和度变化范围
+                image_pil = TF.adjust_brightness(image_pil, brightness)
+                image_pil = TF.adjust_contrast(image_pil, contrast)
+                image_pil = TF.adjust_saturation(image_pil, saturation)
         
         # 转换为张量
         image_tensor = TF.to_tensor(image_pil)
