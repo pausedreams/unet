@@ -1,5 +1,5 @@
 import torch
-from model_unet import UNet
+from models.unet import UNet
 from model_mkunet import ImprovedUNet 
 
 def count_parameters(model):

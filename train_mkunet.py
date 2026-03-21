@@ -11,21 +11,23 @@ from torch.utils.data import DataLoader
 import swanlab
 
 # --- 导入你的改进版模型和数据集 ---
-from model_mkunet import ImprovedUNet 
-from dataset import COCOSegmentationDataset
+from models.mkunet import ImprovedUNet 
+from dataset import TIFSegmentationDataset  # 改为TIF数据集
 
 # ================= 配置区域 =================
 # 训练参数
 BATCH_SIZE = 4
-NUM_EPOCHS = 40
-LEARNING_RATE = 1e-4
+NUM_EPOCHS = 60  # 🔥 增加训练轮数到 60
+LEARNING_RATE = 5e-4  # 🔥 提高初始学习率
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 数据路径
-TRAIN_IMG_DIR = './dataset/Brain_Tumor_Image_DataSet/train'
-TRAIN_ANN_FILE = './dataset/Brain_Tumor_Image_DataSet/train/_annotations.coco.json'
-VAL_IMG_DIR = './dataset/Brain_Tumor_Image_DataSet/valid'
-VAL_ANN_FILE = './dataset/Brain_Tumor_Image_DataSet/valid/_annotations.coco.json'
+# 🔥 新增：梯度累积步数 (模拟更大的 batch size)
+GRADIENT_ACCUMULATION_STEPS = 2
+
+# 数据路径 (修改为 TIF数据集)
+TRAIN_IMG_DIR = './dataset/kaggle_3m/train'
+VAL_IMG_DIR = './dataset/kaggle_3m/valid'
+# TIF数据集不需要注释文件
 # ===========================================
 
 # --- 计算 Dice 和 IoU 的评估函数 ---
@@ -43,16 +45,38 @@ def calculate_metrics(pred, target, threshold=0.5):
     
     return dice.item(), iou.item()
 
-# 定义联合损失函数 (BCE + Dice)
+# ==========================================
+# 🔥 新增：Focal Loss 处理类别不平衡
+# ==========================================
+class FocalLoss(nn.Module):
+    """
+    Focal Loss: 解决前景 - 背景类别不平衡问题
+    gamma=2.0, alpha=0.75 是医学图像分割的推荐值
+    """
+    def __init__(self, alpha=0.75, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, pred, target):
+        bce_loss = nn.BCELoss(reduction='none')(pred, target)
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        return focal_loss.mean()
+
+# 定义联合损失函数 (Focal Loss + Dice，更强调难分样本)
 def combined_loss(pred, target):
-    bce = nn.BCELoss()(pred, target)
+    # Focal Loss (更关注难分类的像素)
+    focal = FocalLoss(alpha=0.75, gamma=2.0)(pred, target)
     
+    # Dice Loss
     pred_flat = pred.view(-1)
     target_flat = target.view(-1)
     intersection = (pred_flat * target_flat).sum()
     dice_loss = 1 - ((2. * intersection + 1e-6) / (pred_flat.sum() + target_flat.sum() + 1e-6))
     
-    return 0.4 * bce + 0.6 * dice_loss
+    # 🔥 调整权重：Focal Loss 0.5 + Dice Loss 0.5
+    return 0.5 * focal + 0.5 * dice_loss
 
 # ==========================================
 # 新增：SwanLab 随机验证集可视化函数
@@ -116,9 +140,9 @@ def log_predictions_to_swanlab(model, dataset, device, num_samples=4):
 # ==========================================
 # 独立的训练核心函数 (已整合深度监督 Deep Supervision)
 # ==========================================
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, save_path):
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, save_path, scheduler=None, gradient_accumulation_steps=1):
     best_val_dice = 0.0
-    patience = 8
+    patience = 10  # 🔥 增加早停耐心值到 10
     patience_counter = 0
     
     print("🏁 开始训练 Improved MK-UNet (开启深度监督 Deep Supervision)...")
@@ -132,37 +156,44 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         train_loss = 0
         train_dice_sum = 0
         train_iou_sum = 0
-        
+                
+        optimizer.zero_grad()  # 🔥 在 batch 循环前清零梯度
+                
         for i, (images, masks) in enumerate(train_loader):
             images, masks = images.to(device), masks.to(device)
-            
-            optimizer.zero_grad()
-            
+                    
             # 🔥 1. 深度监督：接收主分支和两个辅助分支的预测结果
             outputs_main, outputs_up2, outputs_up3 = model(images)
-            
-            # 🔥 2. 将辅助分支的特征图上采样(放大)到真实 Mask 的尺寸 (256x256)
+                    
+            # 🔥 2. 将辅助分支的特征图上采样 (放大) 到真实 Mask 的尺寸 (256x256)
             outputs_up2 = F.interpolate(outputs_up2, size=masks.shape[2:], mode='bilinear', align_corners=False)
             outputs_up3 = F.interpolate(outputs_up3, size=masks.shape[2:], mode='bilinear', align_corners=False)
-            
-            # 🔥 3. 计算多尺度联合损失 (权重分配：主输出0.6, 辅助输出各0.2)
+                    
+            # 🔥 3. 计算多尺度联合损失 (权重分配：主输出 0.6, 辅助输出各 0.2)
             loss_main = criterion(outputs_main, masks)
             loss_up2 = criterion(outputs_up2, masks)
             loss_up3 = criterion(outputs_up3, masks)
             loss = 0.6 * loss_main + 0.2 * loss_up2 + 0.2 * loss_up3
-            
+                    
+            # 🔥 梯度累积：缩放 loss 以模拟更大的 batch size
+            loss = loss / gradient_accumulation_steps
+                    
             loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()
-            
+                    
+            # 🔥 梯度累积：每隔 accumulation_steps 步更新一次参数
+            if (i + 1) % gradient_accumulation_steps == 0 or (i + 1) == len(train_loader):
+                optimizer.step()
+                optimizer.zero_grad()
+                    
+            train_loss += loss.item() * gradient_accumulation_steps  # 恢复原始 loss 用于日志
+                    
             # 注意：计算准确率指标时，只看主分支的表现
             dice, iou = calculate_metrics(outputs_main, masks)
             train_dice_sum += dice
             train_iou_sum += iou
-            
+                    
             if (i + 1) % 10 == 0:
-                print(f"   Batch {i+1}/{len(train_loader)} Total Loss: {loss.item():.4f} (Main: {loss_main.item():.4f})")
+                print(f"   Batch {i+1}/{len(train_loader)} Total Loss: {loss.item()*gradient_accumulation_steps:.4f} (Main: {loss_main.item():.4f})")
 
         avg_train_loss = train_loss / len(train_loader)
         avg_train_dice = train_dice_sum / len(train_loader)
@@ -205,8 +236,13 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             "Train/IoU": avg_train_iou,
             "Val/Loss": avg_val_loss,
             "Val/Dice": avg_val_dice,
-            "Val/IoU": avg_val_iou
+            "Val/IoU": avg_val_iou,
+            "Optimizer/Learning_Rate": scheduler.get_last_lr()[0] if scheduler else optimizer.param_groups[0]['lr']
         }, step=epoch+1)
+        
+        # 🔥 更新学习率调度器
+        if scheduler:
+            scheduler.step()
 
         # 早停与最佳模型保存策略
         if avg_val_dice > best_val_dice:
@@ -235,37 +271,40 @@ def main():
     try:
         run = swanlab.init(
             project="Medical-Image-Segmentation-Graduation", 
-            experiment_name="Innovation-MKUNet-DeepSupervision",
+            experiment_name="Innovation-MKUNet-DeepSupervision-Improved",
             config={
-                "model": "MK-UNet (Deep Supervision)",
+                "model": "MK-UNet (Deep Supervision + Focal Loss)",
                 "batch_size": BATCH_SIZE,
                 "learning_rate": LEARNING_RATE,
                 "epochs": NUM_EPOCHS,
-                "device": str(DEVICE)
+                "device": str(DEVICE),
+                "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS
             }
         )
     except Exception as e:
-        print(f"⚠️ SwanLab 云端连接失败: {e}\n   切换到本地离线模式...")
+        print(f"⚠️ SwanLab 云端连接失败：{e}\n   切换到本地离线模式...")
         run = swanlab.init(
             project="Medical-Image-Segmentation-Graduation", 
-            experiment_name="Innovation-MKUNet-DeepSupervision-Local",
+            experiment_name="Innovation-MKUNet-DeepSupervision-Improved-Local",
             config={
-                "model": "MK-UNet (Deep Supervision)",
+                "model": "MK-UNet (Deep Supervision + Focal Loss)",
                 "batch_size": BATCH_SIZE,
                 "learning_rate": LEARNING_RATE,
                 "epochs": NUM_EPOCHS,
-                "device": str(DEVICE)
+                "device": str(DEVICE),
+                "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS
             },
             mode="local"
         )
 
     # 2. 准备数据集和加载器 (Transform已内置于dataset.py)
     print("\n📊 正在加载数据集 (自带 CLAHE 与同步几何增强)...")
-    train_coco = COCO(TRAIN_ANN_FILE)
-    val_coco = COCO(VAL_ANN_FILE)
+    # TIF数据集不需要COCO
+    # train_coco = COCO(TRAIN_ANN_FILE)
+    # val_coco = COCO(VAL_ANN_FILE)
 
-    train_dataset = COCOSegmentationDataset(train_coco, TRAIN_IMG_DIR)
-    val_dataset = COCOSegmentationDataset(val_coco, VAL_IMG_DIR)
+    train_dataset = TIFSegmentationDataset(TRAIN_IMG_DIR)
+    val_dataset = TIFSegmentationDataset(VAL_IMG_DIR)
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
@@ -278,10 +317,14 @@ def main():
     save_path = 'checkpoints/best_model_mkunet.pth' 
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"🔥 当前 MK-UNet 参数量: {total_params/1e6:.4f} M\n")
-
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
+    print(f"🔥 当前 MK-UNet 参数量：{total_params/1e6:.4f} M\n")
+    
+    # 🔥 优化器：使用 AdamW (带权重衰减)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+        
+    # 🔥 学习率调度器：余弦退火 (Cosine Annealing)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+    
     # 4. 调用训练核心函数
     train_model(
         model=model,
@@ -291,7 +334,9 @@ def main():
         optimizer=optimizer,
         num_epochs=NUM_EPOCHS,
         device=DEVICE,
-        save_path=save_path
+        save_path=save_path,
+        scheduler=scheduler,  # 🔥 传入学习率调度器
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS  # 🔥 传入梯度累积步数
     )
 
     # ==========================================

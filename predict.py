@@ -7,20 +7,19 @@ from torch.utils.data import DataLoader
 import random
 
 # 导入你重命名后的新版模型
-from model_unet import UNet
-from model_mkunet import ImprovedUNet
-from dataset import COCOSegmentationDataset
+from models.unet import UNet
+from models.mkunet import ImprovedUNet
+from dataset import TIFSegmentationDataset  # 改为TIF数据集
 
 # ================= 配置区域 =================
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 测试集路径
-TEST_IMG_DIR = './dataset/Brain_Tumor_Image_DataSet/test'
-TEST_ANN_FILE = './dataset/Brain_Tumor_Image_DataSet/test/_annotations.coco.json'
+# 测试集路径 (修改为TIF数据集)
+TEST_IMG_DIR = './dataset/kaggle_3m/test'  # 需要创建test文件夹
 
 # 🔥 选择你想预测和评估的模型 (修改这里切换)
 # 选项: 'baseline' (标准U-Net) 或 'innovation' (改进的MK-UNet)
-MODEL_TYPE = 'innovation' 
+MODEL_TYPE = 'baseline' 
 
 if MODEL_TYPE == 'baseline':
     MODEL_PATH = 'checkpoints/best_model_unet.pth'
@@ -144,8 +143,9 @@ def evaluate_and_visualize(model, dataset, device, num_samples=6):
 
 def main():
     print("📊 正在初始化测试数据集 (自带 CLAHE 处理)...")
-    test_coco = COCO(TEST_ANN_FILE)
-    test_dataset = COCOSegmentationDataset(test_coco, TEST_IMG_DIR)
+    # TIF数据集不需要COCO
+    # test_coco = COCO(TEST_ANN_FILE)
+    test_dataset = TIFSegmentationDataset(TEST_IMG_DIR)
     
     # 执行评估与可视化，num_samples 改为 6
     evaluate_and_visualize(model, test_dataset, DEVICE, num_samples=6)

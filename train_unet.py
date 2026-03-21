@@ -9,18 +9,19 @@ import torchvision.transforms as transforms
 import swanlab
 
 # 仅导入基线模型和数据集
-from model_unet import UNet
-from dataset import COCOSegmentationDataset
+from models.unet import UNet
+from dataset import TIFSegmentationDataset  # 改为TIF数据集
 
 # ================= 配置区域 =================
-# 数据路径设置
-train_dir = './dataset/Brain_Tumor_Image_DataSet/train'
-val_dir = './dataset/Brain_Tumor_Image_DataSet/valid'
-test_dir = './dataset/Brain_Tumor_Image_DataSet/test'
+# 数据路径设置 (修改为TIF数据集路径)
+train_dir = './dataset/kaggle_3m/train'  # 需要创建这些文件夹
+val_dir = './dataset/kaggle_3m/valid'
+test_dir = './dataset/kaggle_3m/test'
 
-train_annotation_file = './dataset/Brain_Tumor_Image_DataSet/train/_annotations.coco.json'
-test_annotation_file = './dataset/Brain_Tumor_Image_DataSet/test/_annotations.coco.json'
-val_annotation_file = './dataset/Brain_Tumor_Image_DataSet/valid/_annotations.coco.json'
+# TIF数据集不需要注释文件
+# train_annotation_file = ...
+# val_annotation_file = ...
+# test_annotation_file = ...
 # ===========================================
 
 # 定义损失函数 (Dice + BCE 联合损失，很棒的设计)
@@ -161,7 +162,7 @@ def main():
         config={
             "batch_size": 4, 
             "learning_rate": 1e-4,
-            "num_epochs": 40,
+            "num_epochs": 40,  # 恢复为40个epoch
             "device": "cuda" if torch.cuda.is_available() else "cpu",
             "model_type": "Standard_UNet"
         },
@@ -178,15 +179,15 @@ def main():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    # 加载COCO对象
-    train_coco = COCO(train_annotation_file)
-    val_coco = COCO(val_annotation_file)
-    test_coco = COCO(test_annotation_file)
+    # TIF数据集不需要COCO注释
+    # train_coco = COCO(train_annotation_file)
+    # val_coco = COCO(val_annotation_file)
+    # test_coco = COCO(test_annotation_file)
     
     # 创建数据集
-    train_dataset = COCOSegmentationDataset(train_coco, train_dir, transform=transform)
-    val_dataset = COCOSegmentationDataset(val_coco, val_dir, transform=transform)
-    test_dataset = COCOSegmentationDataset(test_coco, test_dir, transform=transform)
+    train_dataset = TIFSegmentationDataset(train_dir)
+    val_dataset = TIFSegmentationDataset(val_dir)
+    test_dataset = TIFSegmentationDataset(test_dir)
     
     # 创建数据加载器
     BATCH_SIZE = swanlab.config["batch_size"]
