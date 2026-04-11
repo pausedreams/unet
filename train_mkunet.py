@@ -157,6 +157,36 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     patience = 10  # 🔥 增加早停耐心值到 10
     patience_counter = 0
     
+    # 🔥 新增：检查是否存在历史最佳模型
+    history_best_path = 'checkpoints/best_model_mkunet_history.pth'
+    if os.path.exists(history_best_path):
+        print(f"\n📂 检测到历史最佳模型: {history_best_path}")
+        try:
+            # 加载历史最佳模型进行评估
+            temp_model = ImprovedUNet(n_channels=3, n_classes=1).to(device)
+            temp_model.load_state_dict(torch.load(history_best_path, map_location=device))
+            temp_model.eval()
+            
+            # 快速评估历史模型性能
+            hist_dice_sum = 0
+            with torch.no_grad():
+                for images, masks in val_loader:
+                    images, masks = images.to(device), masks.to(device)
+                    outputs = temp_model(images)
+                    if isinstance(outputs, tuple):
+                        outputs = outputs[0]
+                    dice, _ = calculate_metrics(torch.sigmoid(outputs), masks)
+                    hist_dice_sum += dice
+            
+            hist_best_dice = hist_dice_sum / len(val_loader)
+            print(f"🏆 历史最佳模型 Val Dice: {hist_best_dice:.4f}\n")
+        except Exception as e:
+            print(f"⚠️  无法加载历史模型: {e}\n")
+            hist_best_dice = 0.0
+    else:
+        hist_best_dice = 0.0
+        print(f"\n📂 未检测到历史最佳模型，将创建新记录\n")
+    
     print("🏁 开始训练 Improved MK-UNet (开启深度监督 Deep Supervision)...")
     start_time = time.time()
     
@@ -281,7 +311,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             best_val_dice = avg_val_dice
             patience_counter = 0
             torch.save(model.state_dict(), save_path)
-            print(f"✅ 模型性能提升 (Dice: {avg_val_dice:.4f})，已保存至 {save_path}")
+            print(f"✅ 本轮训练最佳 (Dice: {avg_val_dice:.4f})，已保存至 {save_path}")
         else:
             patience_counter += 1
             print(f"⚠️ 验证集 Dice 未提升 (Patience: {patience_counter}/{patience})")
@@ -289,8 +319,26 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 print(f"🛑 触发早停机制，训练在第 {epoch+1} 轮提前结束。")
                 break
 
+    # 🔥 新增：训练结束后，与历史最佳模型比较
     total_duration = time.time() - start_time
-    print(f"\n🎉 训练完全结束！总耗时: {total_duration/60:.2f} 分钟")
+    print(f"\n{'='*60}")
+    print(f"🎉 本轮训练完成！总耗时: {total_duration/60:.2f} 分钟")
+    print(f"📊 本轮训练最佳 Val Dice: {best_val_dice:.4f}")
+    print(f"🏆 历史最佳 Val Dice: {hist_best_dice:.4f}")
+    print(f"{'='*60}\n")
+    
+    # 如果本轮表现更好，更新历史最佳
+    if best_val_dice > hist_best_dice:
+        import shutil
+        shutil.copy2(save_path, history_best_path)
+        print(f"🎊 恭喜！本轮模型优于历史最佳，已更新历史最佳模型！")
+        print(f"   新历史最佳: {history_best_path}")
+        print(f"   Dice 提升: {hist_best_dice:.4f} → {best_val_dice:.4f} (+{best_val_dice - hist_best_dice:.4f})\n")
+    else:
+        print(f"💡 本轮模型未超越历史最佳，保持原有记录")
+        print(f"   建议使用历史最佳模型进行预测: {history_best_path}\n")
+    
+    print(f"📝 提示: predict.py 将自动使用历史最佳模型进行预测")
 
 
 def main():

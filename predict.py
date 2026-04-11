@@ -32,8 +32,19 @@ def build_model_from_args(model_type, variant=None):
         print("🚀 正在初始化基线模型 (Baseline U-Net)...")
         model = UNet(n_channels=3, n_classes=1).to(DEVICE)
     elif model_type == 'innovation':
-        mp = 'checkpoints/best_model_mkunet.pth'
-        print("🚀 正在初始化完整创新模型 (Improved MK-UNet)...")
+        # 🔥 优先使用历史最佳模型
+        history_best = 'checkpoints/best_model_mkunet_history.pth'
+        current_best = 'checkpoints/best_model_mkunet.pth'
+        
+        if os.path.exists(history_best):
+            mp = history_best
+            print("🚀 正在初始化完整创新模型 (Improved MK-UNet)...")
+            print(f"🏆 使用历史最佳模型: {mp}")
+        else:
+            mp = current_best
+            print("🚀 正在初始化完整创新模型 (Improved MK-UNet)...")
+            print(f"💡 未找到历史最佳模型，使用当前训练结果: {mp}")
+        
         model = ImprovedUNet(n_channels=3, n_classes=1).to(DEVICE)
     elif model_type == 'ablation':
         if variant not in ABLATION_CONFIGS:
