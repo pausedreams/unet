@@ -17,8 +17,8 @@ from dataset import TIFSegmentationDataset  # 改为TIF数据集
 # ================= 配置区域 =================
 # 训练参数
 BATCH_SIZE = 4
-NUM_EPOCHS = 60  # 🔥 增加训练轮数到 60
-LEARNING_RATE = 3e-4  # 🔥 降低学习率，避免训练崩溃 (从 1e-3 调整到 3e-4)
+NUM_EPOCHS = 100  # 🔥 进一步增加训练轮数到 100，充分训练
+LEARNING_RATE = 2e-4  # 🔥 微调学习率 (从 3e-4 调整到 2e-4)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # 🔥 新增：梯度累积步数 (模拟更大的 batch size)
@@ -82,8 +82,8 @@ def combined_loss(pred, target):
     intersection = (pred_flat * target_flat).sum()
     dice_loss = 1 - ((2. * intersection + 1e-6) / (pred_flat.sum() + target_flat.sum() + 1e-6))
     
-    # 🔥 调整权重：Focal Loss 0.5 + Dice Loss 0.5
-    return 0.5 * focal + 0.5 * dice_loss
+    # 🔥 优化权重：增加 Dice Loss 比重到 0.7，更直接优化 Dice 指标
+    return 0.3 * focal + 0.7 * dice_loss
 
 # ==========================================
 # 新增：混合精度训练 Scaler

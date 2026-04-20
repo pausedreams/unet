@@ -89,9 +89,9 @@ class COCOSegmentationDataset(Dataset):
                 image_pil = TF.rotate(image_pil, angle, interpolation=Image.BILINEAR)
                 mask_pil = TF.rotate(mask_pil, angle, interpolation=Image.NEAREST)
                     
-            # 🔥 新增：随机缩放 (90% - 110%，避免过小导致裁剪失败)
+            # 🔥 新增：随机缩放 (85% - 115%，更激进的范围)
             if random.random() > 0.5:
-                scale = random.uniform(0.9, 1.1)
+                scale = random.uniform(0.85, 1.15)
                 new_size = int(256 * scale)
                 # 确保 new_size 至少为 256
                 if new_size >= 256:
@@ -102,10 +102,11 @@ class COCOSegmentationDataset(Dataset):
                     image_pil = TF.crop(image_pil, i, j, 256, 256)
                     mask_pil = TF.crop(mask_pil, i, j, 256, 256)
                     
-            # 🔥 新增：颜色抖动 (仅图像，不影响 Mask)
+            # 🔥 新增：颜色抖动 (更强的增强)
             if random.random() > 0.5:
-                image_pil = TF.adjust_brightness(image_pil, random.uniform(0.9, 1.1))
-                image_pil = TF.adjust_contrast(image_pil, random.uniform(0.9, 1.1))
+                image_pil = TF.adjust_brightness(image_pil, random.uniform(0.8, 1.2))
+                image_pil = TF.adjust_contrast(image_pil, random.uniform(0.8, 1.2))
+                image_pil = TF.adjust_saturation(image_pil, random.uniform(0.9, 1.1))
 
         # ==========================================
         # 4. 张量转换与标准化
